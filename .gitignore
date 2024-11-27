@@ -1,0 +1,7 @@
+pdfs/
+output_documents/
+output/
+llm_search/
+document_index.csv
+__pycache__/
+.DS_Store
