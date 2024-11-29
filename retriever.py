@@ -1,249 +1,385 @@
-from typing import List, Dict, Any, Tuple, Optional
-import numpy as np
-from sentence_transformers import util
-import torch
-from nltk.tokenize import word_tokenize
 from dataclasses import dataclass
-from anthropic import AsyncAnthropic
+from typing import List, Dict, Any, Optional, Tuple
+import numpy as np
+import faiss
+from rank_bm25 import BM25Okapi
+import torch
+from sentence_transformers import SentenceTransformer
 import asyncio
-from pydantic import BaseModel
+from anthropic import AsyncAnthropic
+import json
+from nltk.tokenize import word_tokenize
+import logging
+from pathlib import Path
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class SearchResult:
+    """Represents a single search result with its relevance information"""
     chunk_id: int
-    file_path: str
     text: str
-    context: str
+    context: Optional[str]
     score: float
-    retrieval_method: str
+    source: str
+    reasoning: Optional[str] = None
 
-class SearchStep(BaseModel):
+@dataclass
+class RetrievalStep:
+    """Represents a single step in the chain-of-thought retrieval process"""
+    query: str
     reasoning: str
-    sub_query: str
     results: List[SearchResult]
+    next_query: Optional[str] = None
 
-class DocumentRetriever:
+class ChainOfThoughtRetriever:
+    """
+    Implements chain-of-thought guided retrieval combining sparse and dense methods
+    with LLM-based reasoning for iterative search refinement.
+    """
+    
     def __init__(
         self,
         documents: Dict[str, Dict],
+        embedding_model: SentenceTransformer,
         anthropic_client: AsyncAnthropic,
-        bm25_weight: float = 0.3,
-        embedding_weight: float = 0.7,
-        top_k: int = 5,
-        max_search_steps: int = 3  # Limit the number of search iterations
+        max_steps: int = 3,
+        results_per_step: int = 5,
+        device: str = None
     ):
         self.documents = documents
+        self.embedding_model = embedding_model
         self.client = anthropic_client
-        self.bm25_weight = bm25_weight
-        self.embedding_weight = embedding_weight
-        self.top_k = top_k
-        self.max_search_steps = max_search_steps
-
-    async def iterative_search(self, query: str) -> Tuple[List[SearchResult], List[SearchStep]]:
-        """
-        Perform an iterative search guided by LLM reasoning.
-        Returns both final results and the search steps for transparency.
-        """
-        search_history = []
+        self.max_steps = max_steps
+        self.results_per_step = results_per_step
+        
+        # Set device for computations
+        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        self.embedding_model.to(self.device)
+        
+        # Initialize document indices
+        self._initialize_indices()
+    
+    def _initialize_indices(self):
+        """Initialize by keeping track of individual document indices and their BM25 indices"""
+        # Initialize our tracking structures
+        self.all_chunks = []          # Stores all chunk information
+        self.doc_indices = {}         # Maps document paths to their FAISS indices
+        self.bm25_indices = {}        # Maps document paths to their BM25 indices
+        self.chunk_to_doc = {}        # Maps chunk IDs to their source documents
+        
+        current_chunk_id = 0
+        
+        # Process each document one at a time
+        for doc_path, doc_data in self.documents.items():
+            chunks = doc_data['chunks']
+            
+            # Store both FAISS and BM25 indices for this document
+            self.doc_indices[doc_path] = doc_data['faiss_index']
+            self.bm25_indices[doc_path] = doc_data['bm25_index']
+            
+            # Process each chunk in the document
+            for chunk in chunks:
+                chunk_id = current_chunk_id
+                
+                self.all_chunks.append({
+                    'chunk_id': chunk_id,
+                    'text': chunk['text'],
+                    'context': chunk.get('context'),
+                    'source': doc_path,
+                    'original_chunk_id': chunk['chunk_id']
+                })
+                
+                self.chunk_to_doc[chunk_id] = doc_path
+                current_chunk_id += 1
+    
+    async def _get_dense_results(self, query: str, k: int) -> List[SearchResult]:
+        """Get results by searching each document's index separately"""
+        # First, we create the query embedding once - we'll use this for all searches
+        query_embedding = self.embedding_model.encode(
+            query,
+            normalize_embeddings=True,
+            device=self.device
+        ).reshape(1, -1).astype('float32')
+        
+        # We'll collect all results here
         all_results = []
         
-        # Initial search planning
-        planning_prompt = f"""You are helping with a document search strategy. 
-        Query: "{query}"
+        # Search through each document's index
+        for doc_path, index in self.doc_indices.items():
+            # Search this document's FAISS index
+            scores, indices = index.search(query_embedding, k)
+            
+            # Process the results from this document
+            for score, idx in zip(scores[0], indices[0]):
+                # Get the chunk information
+                chunk = self.all_chunks[idx]
+                
+                # Verify we're mapping to the correct document
+                # This is a safety check to ensure our indexing is correct
+                if chunk['source'] == doc_path:
+                    all_results.append(SearchResult(
+                        chunk_id=chunk['chunk_id'],
+                        text=chunk['text'],
+                        context=chunk['context'],
+                        score=-score,  # Convert distance to similarity score
+                        source=doc_path
+                    ))
         
-        Think step by step about how to break this search into sub-queries. Consider:
-        1. What's the core information need?
-        2. What related aspects might need exploration?
-        3. How should we start the search?
+        # Sort all results by score and return the top k
+        return sorted(all_results, key=lambda x: x.score, reverse=True)[:k]
+    
+    def _get_sparse_results(self, query: str, k: int) -> List[SearchResult]:
+        """Get results using sparse retrieval with pre-computed BM25 indices"""
+        # Tokenize the query just like we did during preprocessing
+        query_tokens = word_tokenize(query.lower())
         
-        Provide the first focused sub-query we should try. Format:
-        Reasoning: <your step-by-step thought process>
-        Sub-query: <specific search query to try>
+        # We'll collect all results here
+        all_results = []
         
-        Be direct and clear."""
+        # Search through each document's BM25 index
+        for doc_path, bm25_index in self.bm25_indices.items():
+            # Get BM25 scores for this document
+            scores = bm25_index.get_scores(query_tokens)
+            
+            # Get top k indices for this document
+            top_k_indices = np.argsort(scores)[-k:][::-1]
+            
+            # Convert document-specific indices to results
+            for idx in top_k_indices:
+                # Find the corresponding chunk in our global collection
+                chunk = next(
+                    chunk for chunk in self.all_chunks 
+                    if chunk['source'] == doc_path and chunk['original_chunk_id'] == idx
+                )
+                
+                all_results.append(SearchResult(
+                    chunk_id=chunk['chunk_id'],
+                    text=chunk['text'],
+                    context=chunk['context'],
+                    score=scores[idx],
+                    source=doc_path
+                ))
+        
+        # Sort by score and return top k overall
+        return sorted(all_results, key=lambda x: x.score, reverse=True)[:k]
+    
+    def _merge_results(
+        self,
+        dense_results: List[SearchResult],
+        sparse_results: List[SearchResult],
+        k: int
+    ) -> List[SearchResult]:
+        """Merge results from dense and sparse retrieval using rank fusion"""
+        # Create score dictionaries
+        dense_scores = {r.chunk_id: (i + 1, r) for i, r in enumerate(dense_results)}
+        sparse_scores = {r.chunk_id: (i + 1, r) for i, r in enumerate(sparse_results)}
+        
+        # Compute reciprocal rank fusion scores
+        fusion_scores = {}
+        for chunk_id in set(dense_scores.keys()) | set(sparse_scores.keys()):
+            dense_rank = dense_scores.get(chunk_id, (len(dense_results) + 1, None))[0]
+            sparse_rank = sparse_scores.get(chunk_id, (len(sparse_results) + 1, None))[0]
+            
+            # RRF formula with k=60 (default constant)
+            fusion_scores[chunk_id] = 1 / (60 + dense_rank) + 1 / (60 + sparse_rank)
+        
+        # Sort by fusion score and get top k
+        top_chunks = sorted(
+            fusion_scores.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )[:k]
+        
+        # Create merged results list
+        merged_results = []
+        for chunk_id, fusion_score in top_chunks:
+            # Get the result object from either dense or sparse results
+            result = (dense_scores.get(chunk_id, (None, None))[1] or 
+                     sparse_scores.get(chunk_id, (None, None))[1])
+            result.score = fusion_score  # Update score to fusion score
+            merged_results.append(result)
+        
+        return merged_results
+    
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+    async def _get_llm_reasoning(
+        self,
+        query: str,
+        current_results: List[SearchResult],
+        previous_steps: List[RetrievalStep]
+    ) -> Tuple[str, Optional[str]]:
+        """Get LLM reasoning about search results and next query refinement"""
+        try:
+            # Construct context from previous steps if they exist
+            previous_context = ""
+            if previous_steps:
+                step_summaries = []
+                for i, step in enumerate(previous_steps, 1):
+                    first_line_summary = step.reasoning.split('\n')[0]
+                    summary = f"""Step {i}:
+    - Query: "{step.query}"
+    - Key Findings: {first_line_summary}  
+    """
+                    step_summaries.append(summary)
+                previous_context = "Previous Search History:\n" + "\n".join(step_summaries)
 
-        response = await self.client.messages.create(
-            model="claude-3-haiku-20240307",
-            max_tokens=200,
-            temperature=0.3,
-            messages=[{"role": "user", "content": planning_prompt}]
-        )
-        
-        # Extract initial reasoning and sub-query
-        llm_output = response.content[0].text.strip()
-        reasoning = llm_output.split("Sub-query:")[0].replace("Reasoning:", "").strip()
-        sub_query = llm_output.split("Sub-query:")[1].strip()
-        
-        # Iterative search loop
-        for step in range(self.max_search_steps):
-            # Perform search with current sub-query
-            current_results = await self.hybrid_search(sub_query)
-            
-            # Record this search step
-            search_step = SearchStep(
-                reasoning=reasoning,
-                sub_query=sub_query,
-                results=current_results
-            )
-            search_history.append(search_step)
-            
-            # Update all_results
-            all_results.extend(current_results)
-            
-            # Get context from top results
-            context_text = "\n".join([
-                f"Result {i+1}:\n{result.text}\n{result.context}"
-                for i, result in enumerate(current_results[:3])
-            ])
-            
-            # Ask LLM to evaluate and plan next step
-            evaluation_prompt = f"""Original query: "{query}"
-            
-            Search history:
-            {'\n'.join(f'Step {i+1}: {step.sub_query} - {step.reasoning}' 
-                      for i, step in enumerate(search_history))}
-            
-            Recent results:
-            {context_text}
-            
-            Evaluate the search progress and decide next step:
-            1. Have we found enough information to answer the original query?
-            2. If not, what aspect still needs exploration?
-            3. How should we adjust our search?
+            # Format current results with clear structure
+            results_context = "Current Search Results:\n"
+            for i, result in enumerate(current_results, 1):
+                # Include source and relevance score for better context
+                results_context += f"""Result {i} (Source: {Path(result.source).name}, Score: {result.score:.2f}):
+    - Content: {result.text[:300]}...
+    """
 
-            Format response as:
-            Status: [COMPLETE/CONTINUE]
-            Reasoning: <your analysis>
-            Next-query: <next search query if status is CONTINUE>
-            
-            Be precise and direct."""
+            # Construct the structured analysis prompt
+            prompt = f"""Analyze these search results for the query: "{query}"
 
+    {previous_context}
+
+    {results_context}
+
+    Step-by-step Analysis:
+
+    1. Core Information Found:
+    - What specific information in these results directly answers the query?
+    - What are the key concepts or topics covered?
+    - How relevant are the top results to the query?
+
+    2. Missing Elements:
+    - What specific aspects of the query are not addressed in these results?
+    - What important related information would provide more complete understanding?
+    - Are there any gaps in the current coverage?
+
+    3. Query Refinement Decision:
+    Based on this analysis:
+    a) If the results provide comprehensive coverage:
+        Explain why no refinement is needed.
+    
+    b) If important information is missing:
+        - Identify the specific gap to target
+        - Construct a precise query focused on that gap
+        - Use relevant terms found in current results
+        - Target unexplored aspects of the topic
+
+    Provide your complete analysis and then clearly indicate either:
+    SUFFICIENT: [Explanation of why results are complete]
+    or
+    REFINED QUERY: [New specific query targeting identified gaps]
+    """
+
+            # Get LLM response with error handling
             response = await self.client.messages.create(
-                model="claude-3-haiku-20240307",
-                max_tokens=200,
-                temperature=0.3,
-                messages=[{"role": "user", "content": evaluation_prompt}]
+                model="claude-3-sonnet-20240229",
+                max_tokens=750,
+                temperature=0.5,
+                messages=[{"role": "user", "content": prompt}]
             )
             
-            eval_output = response.content[0].text.strip()
-            status = eval_output.split("Status:")[1].split("\n")[0].strip()
+            llm_response = response.content[0].text.strip()
             
-            if "COMPLETE" in status or step == self.max_search_steps - 1:
+            # Parse the LLM response to extract reasoning and potential refined query
+            reasoning = llm_response
+            refined_query = None
+            
+            # Check if the response contains a refined query
+            if "REFINED QUERY:" in llm_response:
+                parts = llm_response.split("REFINED QUERY:", 1)
+                reasoning = parts[0].strip()
+                refined_query = parts[1].strip()
+            
+            # Log the analysis for debugging and improvement
+            logger.debug(f"Query Analysis:\nOriginal Query: {query}\nReasoning: {reasoning}\n"
+                        f"Refined Query: {refined_query}")
+            
+            return reasoning, refined_query
+            
+        except Exception as e:
+            logger.error(f"Error in LLM reasoning: {str(e)}")
+            logger.error(f"Query: {query}")
+            logger.error(f"Results count: {len(current_results)}")
+            raise
+    
+    async def search(
+        self,
+        query: str,
+        return_reasoning: bool = True
+    ) -> Tuple[List[SearchResult], List[RetrievalStep]]:
+        """
+        Perform chain-of-thought guided retrieval for the given query.
+        Returns final results and reasoning steps if requested.
+        """
+        current_query = query
+        retrieval_steps = []
+        
+        for step in range(self.max_steps):
+            # Get results from both retrieval methods
+            dense_results = await self._get_dense_results(
+                current_query,
+                self.results_per_step
+            )
+
+            sparse_results = self._get_sparse_results(
+                current_query,
+                self.results_per_step
+            )
+            
+            # Merge results
+            merged_results = self._merge_results(
+                dense_results,
+                sparse_results,
+                self.results_per_step
+            )
+            
+            # Get LLM reasoning
+            # reasoning, next_query = await self._get_llm_reasoning(
+            #     current_query,
+            #     merged_results,
+            #     retrieval_steps
+            # )
+            reasoning, next_query = "testing mode", None
+            
+            # Record this step
+            current_step = RetrievalStep(
+                query=current_query,
+                reasoning=reasoning,
+                results=merged_results,
+                next_query=next_query
+            )
+            retrieval_steps.append(current_step)
+            
+            # Stop if no next query is suggested
+            if not next_query:
                 break
                 
-            # Extract reasoning and next query
-            reasoning = eval_output.split("Reasoning:")[1].split("Next-query:")[0].strip()
-            sub_query = eval_output.split("Next-query:")[1].strip()
+            current_query = next_query
         
-        # Final ranking of all results
-        final_results = self.rank_fusion(all_results)
-        
-        return final_results[:self.top_k], search_history
-
-    async def hybrid_search(self, query: str) -> List[SearchResult]:
-        """Combine BM25 and embedding search results."""
-        bm25_results = self.bm25_search(query)
-        embedding_results = await self.embedding_search(query)
-        
-        # Combine results using rank fusion
-        combined_results = self.rank_fusion(bm25_results + embedding_results)
-        return combined_results
-
-    def bm25_search(self, query: str) -> List[SearchResult]:
-        """Perform BM25 search across all documents."""
-        query_tokens = word_tokenize(query.lower())
+        # Combine and re-rank all results from all steps
         all_results = []
+        seen_chunks = set()
+        for step in retrieval_steps:
+            for result in step.results:
+                if result.chunk_id not in seen_chunks:
+                    result.reasoning = step.reasoning
+                    all_results.append(result)
+                    seen_chunks.add(result.chunk_id)
         
-        for file_path, doc_data in self.documents.items():
-            bm25 = doc_data['bm25_index']
-            scores = bm25.get_scores(query_tokens)
-            
-            for chunk_id, score in enumerate(scores):
-                chunk = doc_data['chunks'][chunk_id]
-                if score > 0:
-                    all_results.append(SearchResult(
-                        chunk_id=chunk_id,
-                        file_path=file_path,
-                        text=chunk['text'],
-                        context=chunk.get('context', ''),
-                        score=score,
-                        retrieval_method='bm25'
-                    ))
+        # Sort by score (could implement more sophisticated final ranking)
+        final_results = sorted(all_results, key=lambda x: x.score, reverse=True)
         
-        return sorted(all_results, key=lambda x: x.score, reverse=True)[:self.top_k]
+        if return_reasoning:
+            return final_results, retrieval_steps
+        return final_results, []
 
-    async def embedding_search(self, query: str) -> List[SearchResult]:
-        """Perform embedding-based search across all documents."""
-        embeddings = await self.process_embeddings([query])
-        query_embedding = embeddings[0]
-        
-        all_results = []
-        for file_path, doc_data in self.documents.items():
-            chunk_embeddings = np.array([chunk['embedding'] for chunk in doc_data['chunks']])
-            
-            similarities = util.cos_sim(
-                torch.tensor([query_embedding]),
-                torch.tensor(chunk_embeddings)
-            )[0].numpy()
-            
-            for chunk_id, score in enumerate(similarities):
-                chunk = doc_data['chunks'][chunk_id]
-                if score > 0:
-                    all_results.append(SearchResult(
-                        chunk_id=chunk_id,
-                        file_path=file_path,
-                        text=chunk['text'],
-                        context=chunk.get('context', ''),
-                        score=float(score),
-                        retrieval_method='embedding'
-                    ))
-        
-        return sorted(all_results, key=lambda x: x.score, reverse=True)[:self.top_k]
-
-    def rank_fusion(self, results: List[SearchResult]) -> List[SearchResult]:
-        """Combine and re-rank results using weighted reciprocal rank fusion."""
-        chunk_scores = {}
-        
-        for rank, result in enumerate(results):
-            chunk_key = (result.file_path, result.chunk_id)
-            rr = 1 / (rank + 1)
-            weight = self.bm25_weight if result.retrieval_method == 'bm25' else self.embedding_weight
-            weighted_score = rr * weight
-            
-            if chunk_key not in chunk_scores:
-                chunk_scores[chunk_key] = {
-                    'result': result,
-                    'score': weighted_score
-                }
-            else:
-                chunk_scores[chunk_key]['score'] += weighted_score
-        
-        final_results = []
-        for chunk_key, data in chunk_scores.items():
-            result = data['result']
-            result.score = data['score']
-            final_results.append(result)
-        
-        return sorted(final_results, key=lambda x: x.score, reverse=True)
-
-    async def process_embeddings(self, texts: List[str]) -> List[np.ndarray]:
-        """Compute embeddings for search queries."""
-        model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        model = model.to(device)
-        
-        try:
-            with torch.no_grad():
-                embeddings = model.encode(
-                    texts,
-                    normalize_embeddings=True,
-                    device=device,
-                    batch_size=32
-                )
-            return embeddings
-        except Exception as e:
-            print(f"Error computing embeddings: {str(e)}")
-            return [np.zeros(model.get_sentence_embedding_dimension()) for _ in texts]
-        finally:
-            if device == 'cuda':
-                torch.cuda.empty_cache()
+    async def search_with_feedback(
+        self,
+        query: str,
+        relevance_feedback: Optional[Dict[int, float]] = None
+    ) -> Tuple[List[SearchResult], List[RetrievalStep]]:
+        """
+        Perform search with optional relevance feedback from previous results.
+        relevance_feedback should be a dict mapping chunk_ids to relevance scores.
+        """
+        # TODO: Implement relevance feedback mechanism
+        pass

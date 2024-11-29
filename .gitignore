@@ -4,4 +4,5 @@ output/
 llm_search/
 document_index.csv
 __pycache__/
+processed_documents/
 .DS_Store

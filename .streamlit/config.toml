@@ -1,0 +1,19 @@
+[server]
+runOnSave = true
+port = 8501
+maxUploadSize = 200
+
+[browser]
+serverAddress = "localhost"
+gatherUsageStats = false
+
+[runner]
+# Enable faster rerun behavior and file system watching
+fastReruns = true
+watchFileSystem = true
+
+[theme]
+base = "dark"
+
+[logger]
+level = "info"
