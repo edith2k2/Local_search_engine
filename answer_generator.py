@@ -4,6 +4,7 @@ from pathlib import Path
 import logging
 from anthropic import AsyncAnthropic
 from retriever import SearchResult
+import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -201,6 +202,9 @@ Answer:"""
                 logger.warning("No search results provided for answer generation")
                 return None
             
+            # Start timing our process
+            start_time = time.time()
+            
             # Prepare context from search results
             context = self._prepare_context(results)
             
@@ -219,12 +223,15 @@ Answer:"""
             citations = self._extract_citations(results, answer_text)
             confidence = self._calculate_confidence(results, citations)
             
+            # Calculate total processing time
+            total_time = time.time() - start_time
+            
             # Create metadata about the generation process
             metadata = {
                 'model_used': self.model,
                 'temperature': self.temperature,
                 'context_length': len(results[:self.max_context_length]),
-                'generation_time': response.usage.total_time_millis / 1000 if hasattr(response, 'usage') else None
+                'generation_time': total_time  # Our own time measurement
             }
             
             return GeneratedAnswer(
@@ -236,4 +243,6 @@ Answer:"""
             
         except Exception as e:
             logger.error(f"Error generating answer: {str(e)}")
+            logger.error(f"Query: {query}")
+            logger.error(f"Number of results: {len(results) if results else 0}")
             return None
