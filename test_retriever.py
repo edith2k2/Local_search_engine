@@ -2,7 +2,7 @@ import asyncio
 from sentence_transformers import SentenceTransformer
 from anthropic import AsyncAnthropic
 import torch
-from retriever import ChainOfThoughtRetriever
+from temp import ChainOfThoughtRetriever
 from preprocessing import AsyncDocumentProcessor
 import os
 from pathlib import Path
@@ -32,7 +32,7 @@ async def initialize_search_system(processed_documents, api_key):
         embedding_model=embedding_model,
         anthropic_client=anthropic_client,
         device=device,  # Pass the device explicitly
-        max_steps=3,
+        max_iterations=3,
         results_per_step=5
     )
         # In your main code, after initializing the retriever
@@ -72,7 +72,7 @@ async def main():
     # Perform a search
     results, reasoning_steps = await retriever.search(
         "what are the use cases",
-        return_reasoning=True
+        return_steps=True
     )
     
     # Print results
@@ -82,8 +82,11 @@ async def main():
         print(f"Score: {result.score}")
         print(f"Reasoning: {result.reasoning}\n")
     
-    # for step in reasoning_steps:
-    #     print(f"Step: {step}")
+    for step in reasoning_steps:
+        print(f"query: {step.query}")
+        print(f"results: {step.results}")
+        print(f"reasoning: {step.reasoning}\n")
+        print(f"combined_socre: {step.combined_scores}\n")
 
 # Run the async main function
 if __name__ == "__main__":

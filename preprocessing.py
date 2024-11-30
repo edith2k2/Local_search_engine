@@ -26,6 +26,9 @@ from functools import partial
 import PyPDF2
 import logging
 from typing import TypedDict
+import backoff 
+import aiohttp
+import json
 
 # Configure logging with detailed format
 logging.basicConfig(
@@ -132,6 +135,54 @@ def preprocess_text_worker(text: str) -> List[str]:
     except Exception as e:
         logger.error(f"Error in preprocessing worker: {str(e)}")
         return []
+
+class LocalLLMClient:
+    """Client for interacting with local LLM through Ollama API"""
+    
+    def __init__(
+        self,
+        base_url: str = "http://localhost:11434",
+        model: str = "mistral",  # or "llama2" or other models
+        max_retries: int = 3
+    ):
+        self.base_url = base_url
+        self.model = model
+        self.max_retries = max_retries
+        
+    @backoff.on_exception(
+        backoff.expo,
+        (aiohttp.ClientError, TimeoutError),
+        max_tries=3
+    )
+    async def generate_response(
+        self,
+        prompt: str,
+        max_tokens: int = 150,
+        temperature: float = 0.3
+    ) -> str:
+        """Generate response from local LLM"""
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.post(
+                    f"{self.base_url}/api/generate",
+                    json={
+                        "model": self.model,
+                        "prompt": prompt,
+                        "max_tokens": max_tokens,
+                        "temperature": temperature,
+                        "stream": False
+                    },
+                    timeout=30
+                ) as response:
+                    if response.status != 200:
+                        raise Exception(f"API call failed with status {response.status}")
+                    
+                    result = await response.json()
+                    return result['response']
+                    
+            except Exception as e:
+                logger.error(f"Local LLM generation error: {str(e)}")
+                raise
 
 class AsyncDocumentProcessor:
     """

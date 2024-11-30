@@ -51,6 +51,7 @@ class StreamlitSearchUI:
     def _initialize_session_state(self):
         """Initialize all required session state variables with default values"""
         default_state = {
+            'max_search_steps': 3,
             'search_results': None,  # Will store (results, generated_answer) tuple
             'documents': {},
             'components_ready': False,
@@ -68,6 +69,14 @@ class StreamlitSearchUI:
         for key, value in default_state.items():
             if key not in st.session_state:
                 st.session_state[key] = value
+
+    def _update_search_steps(self, new_value: int):
+        """Update max search steps with validation"""
+        if 1 <= new_value <= 5:
+            st.session_state.max_search_steps = new_value
+            # Optionally update retriever configuration
+            if st.session_state.retriever:
+                st.session_state.retriever.max_steps = new_value
 
     def load_configuration(self):
         """Load system configuration with optimal settings for the current environment"""
@@ -122,6 +131,7 @@ class StreamlitSearchUI:
                 documents=st.session_state.documents,
                 embedding_model=processor.embedding_model,
                 anthropic_client=processor.client,
+                max_iterations=st.session_state['max_search_steps'],
                 device=self.config['device']
             )
             
@@ -219,18 +229,18 @@ class StreamlitSearchUI:
             "🟡" if generated_answer.confidence_score >= 0.5 else
             "🔴"
         )
-        st.markdown(
-            f"*Confidence Score: {confidence_color} "
-            f"{generated_answer.confidence_score:.2f}*"
-        )
+        # st.markdown(
+        #     f"*Confidence Score: {confidence_color} "
+        #     f"{generated_answer.confidence_score:.2f}*"
+        # )
         
         # Display answer in a clean box
         st.markdown(
             f"""<div style="padding: 1.5rem; 
             border-radius: 0.5rem; 
-            background-color: #f8f9fa; 
-            border: 1px solid #dee2e6;
-            color: #212529;
+            background-color: #343a40; 
+            border: 1px solid #495057;
+            color: #f8f9fa;
             margin: 1rem 0;
             line-height: 1.6;
             font-size: 1.1rem;">
@@ -239,15 +249,15 @@ class StreamlitSearchUI:
         )
             
         # Display citations
-        if generated_answer.citations:
-            with st.expander("📚 Source Citations"):
-                for i, citation in enumerate(generated_answer.citations, 1):
-                    st.markdown(f"**Source {i}**: {Path(citation.source).name}")
-                    st.markdown(f"*Relevance Score: {citation.score:.2f}*")
-                    st.markdown(f'"{citation.text}"')
-                    if citation.context:
-                        st.markdown(f"*Context: {citation.context}*")
-                    st.markdown("---")
+        # if generated_answer.citations:
+        #     with st.expander("📚 Source Citations"):
+        #         for i, citation in enumerate(generated_answer.citations, 1):
+        #             st.markdown(f"**Source {i}**: {Path(citation.source).name}")
+        #             st.markdown(f"*Relevance Score: {citation.score:.2f}*")
+        #             st.markdown(f'"{citation.text}"')
+        #             if citation.context:
+        #                 st.markdown(f"*Context: {citation.context}*")
+        #             st.markdown("---")
         
         # Display timing information if available
         if generated_answer.metadata.get('generation_time'):
@@ -263,22 +273,41 @@ class StreamlitSearchUI:
         # Display processing time if available
         if st.session_state.processing_time:
             st.markdown(
-                f"*Search completed in {st.session_state.processing_time:.2f} seconds*"
+                f"*chain of thought search with {st.session_state.retriever.max_iterations} iterations completed in {st.session_state.processing_time:.2f} seconds*"
             )
         
-        # Display results in expandable sections
-        for i, result in enumerate(results, 1):
-            if hasattr(result, 'source'):
-                with st.expander(
-                    f"Result {i} - {Path(result.source).name} "
-                    f"(Score: {result.score:.2f})"
-                ):
-                    st.markdown(result.text)
+        # Group results by source document
+        results_by_source = {}
+        for result in results:
+            if result.source not in results_by_source:
+                results_by_source[result.source] = []
+            results_by_source[result.source].append(result)
+        
+        for source, source_results in results_by_source.items():
+            with st.expander(f"📄 {Path(source).name} ({len(source_results)} results)"):
+                for i, result in enumerate(source_results, 1):
+                    st.markdown(
+                        f"""<div style="
+                        padding: 1rem;
+                        border-left: 3px solid #3498db;
+                        background-color: #343a40;
+                        color: #f8f9fa;
+                        margin: 0.5rem 0;">
+                        <p>{result.text}</p>
+                        </div>""",
+                        unsafe_allow_html=True
+                    )
+                    
                     if result.context:
                         st.markdown("**Context:**")
                         st.markdown(f"*{result.context}*")
-            else:
-                st.warning("Result {i} is not in the expected format")
+                    
+                    if result.reasoning:
+                        st.markdown("**Analysis:**")
+                        st.markdown(f"*{result.reasoning}*")
+                    
+                    if i < len(source_results):
+                        st.markdown("---")
 
     def render_ui(self):
         """Render the main user interface"""
@@ -288,6 +317,19 @@ class StreamlitSearchUI:
         with st.sidebar:
             st.header("Configuration")
             
+            st.header("Search Configuration")
+            
+            # Use number_input for better control
+            steps = st.number_input(
+                "Maximum Search Steps",
+                min_value=1,
+                max_value=5,
+                value=st.session_state.max_search_steps,
+                help="Set the maximum number of search refinement steps",
+                on_change=self._update_search_steps,
+                args=(st.session_state.max_search_steps,)
+            )
+
             # API key input if not set
             if not st.session_state.api_key:
                 api_key = st.text_input(
