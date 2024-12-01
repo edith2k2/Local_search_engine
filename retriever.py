@@ -16,6 +16,8 @@ import time
 from sklearn.metrics.pairwise import cosine_similarity
 from datetime import datetime
 from query_classifier import QueryClassifier, QueryType
+from query_parser import TemporalQueryParser, TemporalConstraints, TimeFrame, SearchParameters
+from dataclasses import field
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -30,6 +32,7 @@ class SearchResult:
     score: float
     source: str
     reasoning: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __str__(self) -> str:
         """Provides a clean, formatted string representation"""
@@ -171,6 +174,7 @@ class ChainOfThoughtRetriever:
         self.min_confidence_threshold = min_confidence_threshold
         self.results_per_step = results_per_step
         self.query_classifier = QueryClassifier()
+        self.temporal_parser = TemporalQueryParser()
         
         # Initialize document indices
         self._initialize_indices()
@@ -191,7 +195,8 @@ class ChainOfThoughtRetriever:
         # Process each document one at a time
         for doc_path, doc_data in self.documents.items():
             chunks = doc_data['chunks']
-            
+            metadata = doc_data['metadata']
+
             # Store both FAISS and BM25 indices for this document
             self.doc_indices[doc_path] = doc_data['faiss_index']
             self.bm25_indices[doc_path] = doc_data['bm25_index']
@@ -205,7 +210,8 @@ class ChainOfThoughtRetriever:
                     'text': chunk['text'],
                     'context': chunk.get('context'),
                     'source': doc_path,
-                    'original_chunk_id': chunk['chunk_id']
+                    'original_chunk_id': chunk['chunk_id'],
+                    'metadata': metadata
                 })
                 
                 self.chunk_to_doc[chunk_id] = doc_path
@@ -259,6 +265,50 @@ CONFIDENCE:
 REASONING:
 [Detailed explanation of your analysis and decision]"""
     
+    def update_documents(self, documents: Dict[str, Dict]):
+        """
+        Update the retriever by adding newly processed documents to existing indices.
+        
+        Args:
+            documents: Dictionary mapping file paths to document data including
+                    metadata, chunks, faiss_index, and bm25_index
+        """
+        try:
+            # Get our current chunk_id to continue numbering
+            current_chunk_id = len(self.all_chunks)
+            
+            # Process each new or updated document
+            for doc_path, doc_data in documents.items():
+                # Store indices for this document
+                self.doc_indices[doc_path] = doc_data['faiss_index']
+                self.bm25_indices[doc_path] = doc_data['bm25_index']
+                
+                # Process each chunk in the document
+                for chunk in doc_data['chunks']:
+                    chunk_id = current_chunk_id
+                    
+                    # Add to our chunk tracking structures
+                    self.all_chunks.append({
+                        'chunk_id': chunk_id,
+                        'text': chunk['text'],
+                        'context': chunk.get('context'),
+                        'source': doc_path,
+                        'original_chunk_id': chunk['chunk_id'],
+                        'metadata': doc_data['metadata']
+                    })
+                    
+                    self.chunk_to_doc[chunk_id] = doc_path
+                    current_chunk_id += 1
+            
+            logger.info(
+                f"Added {len(documents)} documents to retriever. "
+                f"Total chunks now indexed: {len(self.all_chunks)}"
+            )
+            
+        except Exception as e:
+            logger.error(f"Error adding documents to retriever: {str(e)}")
+            raise
+
     async def _get_dense_results(
         self,
         query: str,
@@ -299,7 +349,8 @@ REASONING:
                             text=chunk['text'],
                             context=chunk['context'],
                             score=-score,  # Convert distance to similarity
-                            source=doc_path
+                            source=doc_path,
+                            metadata=chunk['metadata']
                         ))
             
             # Sort by score and return top k
@@ -352,7 +403,8 @@ REASONING:
                         text=chunk['text'],
                         context=chunk['context'],
                         score=scores[idx],
-                        source=doc_path
+                        source=doc_path,
+                        metadata=chunk['metadata']
                     ))
             
             # Sort by score and return top k
@@ -609,12 +661,13 @@ Identified Redundancies:
     def _combine_scores(
         self,
         dense_results: List[SearchResult],
-        sparse_results: List[SearchResult]
+        sparse_results: List[SearchResult],
+        weights: Dict[str, float]
     ) -> Dict[str, float]:
         """
         Combine scores from dense and sparse retrieval methods using a weighted approach.
         
-        This method implements a sophisticated score combination strategy that:
+        This method implements a score combination strategy that:
         1. Normalizes scores from both methods to a comparable range
         2. Applies method-specific weights based on query characteristics
         3. Considers result positions in both rankings
@@ -659,58 +712,253 @@ Identified Redundancies:
             
             # Combine scores with method weights and position adjustment
             combined_scores[str(chunk_id)] = (
-                0.6 * dense_norm +  # Dense retrieval weight
-                0.4 * sparse_norm   # Sparse retrieval weight
+                weights['dense'] * dense_norm +  # Dense retrieval weight
+                weights['sparse'] * sparse_norm   # Sparse retrieval weight
             ) * position_weight
         
         return combined_scores
-
-    async def search(
+    
+    def _calculate_result_metrics(
         self,
+        result: SearchResult,
         query: str,
-        return_steps: bool = False
-    ) -> Tuple[List[SearchResult], Optional[List[SearchIteration]]]:
+        current_query: str
+    ) -> Dict[str, float]:
         """
-        Perform iterative chain-of-thought guided search with query refinement.
-        
-        This method implements a sophisticated search process that:
-        1. Combines dense and sparse retrieval
-        2. Uses LLM-based reasoning for analysis
-        3. Iteratively refines the search based on identified gaps
-        4. Handles redundancy and maintains search quality
-        
-        Args:
-            query: Initial search query
-            return_steps: Whether to return intermediate search steps
-            
-        Returns:
-            Tuple of (final_results, search_iterations if return_steps=True)
+        Calculate objective quality metrics for each search result. These metrics help us 
+        evaluate results using measurable criteria alongside LLM confidence scores.
         """
         try:
+            # Calculate semantic similarity with both original and current queries
+            query_embedding = self.embedding_model.encode(
+                query,
+                normalize_embeddings=True,
+                device=self.device
+            )
+            current_query_embedding = self.embedding_model.encode(
+                current_query,
+                normalize_embeddings=True,
+                device=self.device
+            )
+            text_embedding = self.embedding_model.encode(
+                result.text,
+                normalize_embeddings=True,
+                device=self.device
+            )
+            
+            # Calculate similarities
+            original_sim = float(np.dot(text_embedding, query_embedding))
+            current_sim = float(np.dot(text_embedding, current_query_embedding))
+            
+            # Calculate text quality metrics
+            words = result.text.lower().split()
+            unique_words = len(set(words)) / len(words) if words else 0
+            
+            # Calculate keyword matches
+            query_words = set(query.lower().split())
+            matches = sum(1 for word in query_words if word in result.text.lower())
+            keyword_score = matches / len(query_words) if query_words else 0
+            
+            return {
+                'semantic_relevance': (original_sim + current_sim) / 2,
+                'text_quality': unique_words,
+                'keyword_match': keyword_score,
+                'has_context': 1.0 if result.context else 0.0
+            }
+        except Exception as e:
+            logger.error(f"Error calculating result metrics: {str(e)}")
+            return {
+                'semantic_relevance': 0.0,
+                'text_quality': 0.0,
+                'keyword_match': 0.0,
+                'has_context': 0.0
+            }
+
+    def _select_best_results(
+        self,
+        accumulated_results: Dict[int, Dict],
+        result_metrics: Dict[int, Dict[str, float]],
+        iterations: List[SearchIteration]
+    ) -> List[SearchResult]:
+        """
+        Select best results using a comprehensive scoring approach that incorporates:
+        1. Combined scores from dense and sparse retrieval
+        2. Objective metrics like semantic similarity and text quality
+        3. LLM confidence scores
+        4. Result consistency across iterations
+        """
+        try:
+            final_scores = {}
+            
+            for chunk_id, data in accumulated_results.items():
+                metrics = result_metrics[chunk_id]
+                
+                # Get combined scores from iterations where this result appeared
+                retrieval_scores = []
+                llm_confidences = []
+                
+                for iteration in iterations:
+                    if str(chunk_id) in iteration.combined_scores:
+                        # Use the combined score from dense and sparse retrieval
+                        retrieval_scores.append(iteration.combined_scores[str(chunk_id)])
+                        
+                    if iteration.reasoning != None and str(chunk_id) in iteration.reasoning.relevance_findings:
+                        # Include LLM confidence scores
+                        llm_confidences.append(iteration.reasoning.confidence_score)
+                
+                # Calculate average scores with defaults
+                avg_retrieval_score = (
+                    sum(retrieval_scores) / len(retrieval_scores)
+                    if retrieval_scores else 0.5
+                )
+                avg_llm_confidence = (
+                    sum(llm_confidences) / len(llm_confidences)
+                    if llm_confidences else 0.5
+                )
+                
+                # Calculate comprehensive final score
+                objective_score = (
+                    0.3 * avg_retrieval_score +           # Combined dense/sparse retrieval score
+                    0.2 * metrics['semantic_relevance'] +  # Semantic similarity
+                    0.2 * metrics['text_quality'] +        # Text quality
+                    0.1 * metrics['keyword_match']         # Direct keyword matches
+                )
+                
+                subjective_score = (
+                    0.1 * avg_llm_confidence +            # LLM confidence
+                    0.1 * (len(data['iterations_found']) / len(iterations))  # Consistency
+                )
+                
+                # Store detailed score breakdown
+                final_scores[chunk_id] = {
+                    'total_score': objective_score + subjective_score,
+                    'retrieval_score': avg_retrieval_score,
+                    'objective_score': objective_score,
+                    'subjective_score': subjective_score,
+                    'llm_confidence': avg_llm_confidence
+                }
+            
+            # Sort and prepare final results with score metadata
+            sorted_results = sorted(
+                accumulated_results.items(),
+                key=lambda x: final_scores[x[0]]['total_score'],
+                reverse=True
+            )
+            
+            final_results = []
+            for chunk_id, data in sorted_results[:self.results_per_step]:
+                result = data['result']
+                result.metadata['score_breakdown'] = final_scores[chunk_id]
+                final_results.append(result)
+            
+            return final_results
+            
+        except Exception as e:
+            logger.error(f"Error selecting best results: {str(e)}")
+            return list(accumulated_results.values())[:self.results_per_step]
+    
+    async def search(
+    self,
+    query: str,
+    return_steps: bool = False
+) -> Tuple[List[SearchResult], Optional[List[SearchIteration]]]:
+        """
+        Perform an enhanced iterative search that combines multiple retrieval strategies
+        with careful result accumulation and intelligent scoring.
+        
+        This implementation addresses several key aspects:
+        1. Properly handles final query refinements
+        2. Uses both objective metrics and LLM insights for scoring
+        3. Accumulates results across iterations for comprehensive coverage
+        4. Maintains detailed tracking of search progression
+        """
+        try:
+            # Initialize tracking variables for our search process
             current_query = query
             iterations = []
-            best_results = None
-            best_confidence = 0.0
+            accumulated_results = {}  # Stores all unique results we find
+            result_metrics = {}      # Stores our objective measurements
             
-            for iteration in range(self.max_iterations):
-                # Analyze query
-                query_analysis = self.query_classifier.analyze_query(current_query)
-                logger.info(f"Query type: {query_analysis.query_type.value}, "
-                        f"Confidence: {query_analysis.confidence:.2f}")
+            # First, perform our initial retrieval with the original query
+            logger.info(f"Performing initial retrieval with query: {current_query}")
+            query_analysis = self.query_classifier.analyze_query(current_query)
+            
+            dense_results = await self._get_dense_results(
+                current_query,
+                self.results_per_step
+            )
+            sparse_results = self._get_sparse_results(
+                current_query,
+                self.results_per_step
+            )
+            
+            current_results = self._merge_results(
+                dense_results,
+                sparse_results,
+                query_analysis.weights,
+                query_analysis.query_type,
+                self.results_per_step
+            )
+            
+            if not current_results:
+                logger.warning(f"No results found for initial query: {current_query}")
+                return [], None if not return_steps else None
                 
-                # Get results from both retrieval methods
-                print(f"Getting results for query: {current_query}")
+            # Process and store our initial results
+            logger.info(f"Processing initial results...")
+            for result in current_results:
+                logger.info(f"Processing result: {result}")
+                if result.chunk_id not in result_metrics:
+                    result_metrics[result.chunk_id] = self._calculate_result_metrics(
+                        result=result,
+                        query=query,
+                        current_query=current_query
+                    )
+                    
+                accumulated_results[result.chunk_id] = {
+                    'result': result,
+                    'metrics': result_metrics[result.chunk_id],
+                    'iterations_found': [0]
+                }
+
+            # Now perform exactly max_iterations rounds of LLM analysis and retrieval
+            for iteration in range(self.max_iterations):
+                # Get LLM's analysis of current results
+                reasoning = await self._get_reasoned_analysis(
+                    current_query,
+                    current_results,
+                    iterations
+                )
+                
+                # Record the completed iteration
+                iterations.append(SearchIteration(
+                    query=current_query,
+                    results=current_results,
+                    reasoning=reasoning,
+                    combined_scores=self._combine_scores(dense_results, sparse_results, query_analysis.weights),
+                    timestamp=time.time()
+                ))
+                
+                # If LLM suggests a refinement, use it for the next retrieval
+                if reasoning.suggested_refinement:
+                    current_query = reasoning.suggested_refinement
+                else:
+                    # If no refinement suggested, use original query as fallback
+                    current_query = query
+                    
+                # Perform the next retrieval with either the refined or original query
+                logger.info(f"Performing retrieval {iteration + 2} with query: {current_query}")
+                
                 dense_results = await self._get_dense_results(
                     current_query,
                     self.results_per_step
                 )
-                
                 sparse_results = self._get_sparse_results(
                     current_query,
                     self.results_per_step
                 )
                 
-                # Merge results
+                query_analysis = self.query_classifier.analyze_query(current_query)
                 current_results = self._merge_results(
                     dense_results,
                     sparse_results,
@@ -719,52 +967,47 @@ Identified Redundancies:
                     self.results_per_step
                 )
                 
-                # Skip iteration if no results found
-                if not current_results:
-                    logger.warning(f"No results found for query: {current_query}")
-                    break
-                
-                # Calculate combined scores
-                combined_scores = self._combine_scores(dense_results, sparse_results)
-                
-                # Get reasoned analysis
-                reasoning = await self._get_reasoned_analysis(
-                    current_query,
-                    current_results,
-                    iterations
-                )
-                
-                # Record iteration
-                current_iteration = SearchIteration(
-                    query=current_query,
-                    results=current_results,
-                    reasoning=reasoning,
-                    combined_scores=combined_scores,
-                    timestamp=time.time()
-                )
-                iterations.append(current_iteration)
-                
-                # Update best results if confidence is higher
-                if reasoning.confidence_score > best_confidence:
-                    best_results = current_results
-                    best_confidence = reasoning.confidence_score
-                
-                # Check if we should continue
-                if (not reasoning.suggested_refinement or 
-                    reasoning.confidence_score >= self.min_confidence_threshold):
-                    break
-                
-                # Update query for next iteration
-                current_query = reasoning.suggested_refinement
+                # Process and store results from this retrieval
+                logger.info(f"Processing results for iteration {iteration + 2}...")
+                for result in current_results:
+                    logger.info(f"Processing result: {result}")
+                    if result.chunk_id not in result_metrics:
+                        result_metrics[result.chunk_id] = self._calculate_result_metrics(
+                            result=result,
+                            query=query,
+                            current_query=current_query
+                        )
+                        
+                    if result.chunk_id not in accumulated_results:
+                        accumulated_results[result.chunk_id] = {
+                            'result': result,
+                            'metrics': result_metrics[result.chunk_id],
+                            'iterations_found': [iteration + 1]
+                        }
+                    else:
+                        accumulated_results[result.chunk_id]['iterations_found'].append(iteration + 1)
             
-            # Select final results
-            final_results = best_results or current_results
+            # Record the last iteration
+            iterations.append(SearchIteration(
+                query=current_query,
+                results=current_results,
+                reasoning=None,
+                combined_scores=self._combine_scores(dense_results, sparse_results, query_analysis.weights),
+                timestamp=time.time()
+            ))
+
+            # Select our final results using our comprehensive scoring
+            final_results = self._select_best_results(
+                accumulated_results=accumulated_results,
+                result_metrics=result_metrics,
+                iterations=iterations
+            )
             
-            # Add reasoning to results
+            # Add reasoning to final results
             for result in final_results:
                 relevant_iteration = next(
                     (it for it in reversed(iterations) 
-                     if str(result.chunk_id) in it.reasoning.relevance_findings),
+                    if it.reasoning != None and  str(result.chunk_id) in it.reasoning.relevance_findings),
                     None
                 )
                 if relevant_iteration:
@@ -778,7 +1021,107 @@ Identified Redundancies:
             logger.error(f"Error in search process: {str(e)}")
             logger.error(f"Initial query: {query}")
             return [], None if not return_steps else None
+    
+    def _apply_temporal_scoring(
+        self,
+        result: SearchResult,
+        constraints: TemporalConstraints
+    ) -> float:
+        """Calculate temporal relevance score for a result"""
+        doc_timestamp = datetime.fromisoformat(result.metadata.get('created_time', ''))
+        now = datetime.now()
+        
+        # Handle different time frames
+        if constraints.time_frame == TimeFrame.ALL_TIME:
+            days_old = (now - doc_timestamp).days
+            return 1.0 * (0.95 ** days_old)
+            
+        if constraints.time_frame == TimeFrame.STRICT:
+            if (constraints.start_date and doc_timestamp < constraints.start_date or
+                constraints.end_date and doc_timestamp > constraints.end_date):
+                return 0.0
+            return 1.0
+            
+        # Flexible scoring with decay
+        if constraints.start_date and doc_timestamp < constraints.start_date:
+            days_before = (constraints.start_date - doc_timestamp).days
+            return 0.5 * (0.9 ** days_before)
+            
+        if constraints.end_date and doc_timestamp > constraints.end_date:
+            days_after = (doc_timestamp - constraints.end_date).days
+            return 0.5 * (0.9 ** days_after)
+            
+        # Document is within range
+        time_range = (constraints.end_date or now) - (constraints.start_date or doc_timestamp)
+        position = (doc_timestamp - (constraints.start_date or doc_timestamp)).total_seconds()
+        relative_position = position / max(time_range.total_seconds(), 1)
+        
+        return 1.0 + (0.5 * relative_position)
 
+    async def search_with_parameters(
+        self,
+        params: SearchParameters,
+        return_steps: bool = False
+    ) -> Tuple[List[SearchResult], Optional[List[SearchIteration]]]:
+        """
+        Perform search with combined UI and natural language temporal parameters
+
+        This method implements a two-step temporal processing approach:
+        1. First, it parses any temporal expressions in the natural language query
+        2. Then, it combines these with any UI-specified temporal constraints
+        """
+        try:
+            # First, parse temporal expressions from the query
+            cleaned_query, nl_temporal = self.temporal_parser.parse_query(params.query)
+            
+            # Log the parsing results for transparency
+            logger.info(
+                f"Temporal parsing results:"
+                f"\nOriginal query: {params.query}"
+                f"\nCleaned query: {cleaned_query}"
+                f"\nDetected temporal constraints: {nl_temporal}"
+            )
+            
+            # Update search parameters with natural language temporal info
+            params.nl_temporal = nl_temporal
+            params.query = cleaned_query
+
+            # Get effective temporal constraints
+            constraints = params.get_effective_constraints()
+            
+            # Log search parameters
+            logger.info(
+                f"Final search configuration:"
+                f"\nQuery: {params.query}"
+                f"\nUI Temporal: {params.ui_temporal}"
+                f"\nNL Temporal: {params.nl_temporal}"
+                f"\nEffective Constraints: {constraints}"
+            )
+            
+            # Perform base search
+            results, steps = await self.search(params.query, return_steps)
+            
+            # Apply temporal filtering and scoring
+            if constraints.has_constraints:
+                filtered_results = []
+                for result in results:
+                    temporal_score = self._apply_temporal_scoring(result, constraints)
+                    
+                    if temporal_score > 0:
+                        result.score *= temporal_score
+                        result.metadata['temporal_score'] = temporal_score
+                        filtered_results.append(result)
+                
+                # Sort by adjusted scores
+                filtered_results.sort(key=lambda x: x.score, reverse=True)
+                results = filtered_results
+            
+            return results, steps
+            
+        except Exception as e:
+            logger.error(f"Error in temporal search: {str(e)}")
+            return [], None if not return_steps else None
+        
     async def search_with_feedback(
         self,
         query: str,

@@ -136,6 +136,15 @@ def preprocess_text_worker(text: str) -> List[str]:
         logger.error(f"Error in preprocessing worker: {str(e)}")
         return []
 
+def create_process_pool(num_processes: int) -> ProcessPoolExecutor:
+    """Create a process pool with proper initialization"""
+    import preprocessing  # Ensure we're using the module's function directly
+    
+    return ProcessPoolExecutor(
+        max_workers=num_processes,
+        initializer=initialize_worker  # Use fully qualified reference
+    )
+
 class LocalLLMClient:
     """Client for interacting with local LLM through Ollama API"""
     
@@ -226,14 +235,15 @@ class AsyncDocumentProcessor:
         logger.info(f"Using device: {self.device}")
         
         # Initialize multiprocessing components
-        self.num_processes = num_processes or max(1, multiprocessing.cpu_count() - 1)
+        self.num_processes = num_processes or max(1, multiprocessing.cpu_count() - 3)
         logger.info(f"Initializing with {self.num_processes} processes")
         
         # Create process pool with initialization
-        self.process_pool = ProcessPoolExecutor(
-            max_workers=self.num_processes,
-            initializer=initialize_worker
-        )
+        # self.process_pool = ProcessPoolExecutor(
+        #     max_workers=self.num_processes,
+        #     initializer=initialize_worker
+        # )
+        self.process_pool = create_process_pool(self.num_processes)
         
         # Create thread pool for I/O operations
         self.thread_pool = ThreadPoolExecutor(
