@@ -883,6 +883,10 @@ Identified Redundancies:
             logger.info(f"Performing initial retrieval with query: {current_query}")
             query_analysis = self.query_classifier.analyze_query(current_query)
             
+            current_query = query_analysis.corrected_query
+            logger.info(f"Corrected query: {current_query}")
+            logger.info(f"Query type: {query_analysis.query_type}")
+
             dense_results = await self._get_dense_results(
                 current_query,
                 self.results_per_step
@@ -949,6 +953,8 @@ Identified Redundancies:
                 # Perform the next retrieval with either the refined or original query
                 logger.info(f"Performing retrieval {iteration + 2} with query: {current_query}")
                 
+                logger.info(f"Query type: {query_analysis.query_type}")
+
                 dense_results = await self._get_dense_results(
                     current_query,
                     self.results_per_step

@@ -94,28 +94,20 @@ class AnswerGenerator:
         Returns:
             Complete prompt for the LLM
         """
-        return f"""Generate a comprehensive answer to the following question using only the provided source passages. 
-
-Question: {query}
+        return f"""Synthesize information from the provided sources to answer this question: {query}
 
 Source Passages:
 
 {context}
 
-Instructions:
-1. Synthesize information from the provided sources to create a clear, coherent answer
-2. Use objective language and maintain accuracy to the source material
-3. Include specific information from the sources with clear attribution
-4. If the sources don't contain enough information to fully answer the query, acknowledge this
-5. Structure the answer to build understanding progressively
+Create a comprehensive answer that:
+1. Starts with a direct response to the question
+2. Uses specific details and evidence from the sources
+3. Attributes information using "Source [X]" citations
+4. Connects related concepts to build understanding
+5. Concludes with key takeaways
 
-Format the answer as follows:
-- Start with a direct answer to the question
-- Follow with supporting details and explanations
-- End with a summary of key points
-- Use "According to [Source X]" or similar phrases to attribute information
-
-Answer:"""
+Your answer:"""
 
     def _extract_citations(
         self,
