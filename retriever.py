@@ -152,7 +152,7 @@ class ChainOfThoughtRetriever:
         device: str = None,
         max_iterations: int = 3,
         min_confidence_threshold: float = 0.7,
-        results_per_step: int = 5
+        top_k: int = 5
     ):
         """
         Initialize the retriever with necessary components and configuration.
@@ -164,7 +164,7 @@ class ChainOfThoughtRetriever:
             device: Computing device for embeddings
             max_iterations: Maximum number of refinement iterations
             min_confidence_threshold: Minimum confidence to accept results
-            results_per_step: Number of results to return per iteration
+            top_k: Number of results to return per iteration
         """
         self.documents = documents
         self.embedding_model = embedding_model
@@ -172,7 +172,7 @@ class ChainOfThoughtRetriever:
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
         self.max_iterations = max_iterations
         self.min_confidence_threshold = min_confidence_threshold
-        self.results_per_step = results_per_step
+        self.top_k = top_k
         self.query_classifier = QueryClassifier()
         self.temporal_parser = TemporalQueryParser()
         
@@ -846,7 +846,7 @@ Identified Redundancies:
             )
             
             final_results = []
-            for chunk_id, data in sorted_results[:self.results_per_step]:
+            for chunk_id, data in sorted_results[:self.top_k]:
                 result = data['result']
                 result.metadata['score_breakdown'] = final_scores[chunk_id]
                 final_results.append(result)
@@ -855,7 +855,7 @@ Identified Redundancies:
             
         except Exception as e:
             logger.error(f"Error selecting best results: {str(e)}")
-            return list(accumulated_results.values())[:self.results_per_step]
+            return list(accumulated_results.values())[:self.top_k]
     
     async def search(
     self,
@@ -889,11 +889,11 @@ Identified Redundancies:
 
             dense_results = await self._get_dense_results(
                 current_query,
-                self.results_per_step
+                self.top_k
             )
             sparse_results = self._get_sparse_results(
                 current_query,
-                self.results_per_step
+                self.top_k
             )
             
             current_results = self._merge_results(
@@ -901,7 +901,7 @@ Identified Redundancies:
                 sparse_results,
                 query_analysis.weights,
                 query_analysis.query_type,
-                self.results_per_step
+                self.top_k
             )
             
             if not current_results:
@@ -911,7 +911,7 @@ Identified Redundancies:
             # Process and store our initial results
             logger.info(f"Processing initial results...")
             for result in current_results:
-                logger.info(f"Processing result: {result}")
+                # logger.info(f"Processing result: {result}")
                 if result.chunk_id not in result_metrics:
                     result_metrics[result.chunk_id] = self._calculate_result_metrics(
                         result=result,
@@ -957,11 +957,11 @@ Identified Redundancies:
 
                 dense_results = await self._get_dense_results(
                     current_query,
-                    self.results_per_step
+                    self.top_k
                 )
                 sparse_results = self._get_sparse_results(
                     current_query,
-                    self.results_per_step
+                    self.top_k
                 )
                 
                 query_analysis = self.query_classifier.analyze_query(current_query)
@@ -970,13 +970,13 @@ Identified Redundancies:
                     sparse_results,
                     query_analysis.weights,
                     query_analysis.query_type,
-                    self.results_per_step
+                    self.top_k
                 )
                 
                 # Process and store results from this retrieval
                 logger.info(f"Processing results for iteration {iteration + 2}...")
                 for result in current_results:
-                    logger.info(f"Processing result: {result}")
+                    # logger.info(f"Processing result: {result}")
                     if result.chunk_id not in result_metrics:
                         result_metrics[result.chunk_id] = self._calculate_result_metrics(
                             result=result,
@@ -1039,10 +1039,13 @@ Identified Redundancies:
         
         # Handle different time frames
         if constraints.time_frame == TimeFrame.ALL_TIME:
+            logger.info("No time constraints specified. Defaulting to full time range.")
             days_old = (now - doc_timestamp).days
             return 1.0 * (0.95 ** days_old)
             
         if constraints.time_frame == TimeFrame.STRICT:
+            logger.info(f"Strict time constraints")
+            logger.info(f"Document timestamp: {doc_timestamp}\n Constraints: {constraints}")
             if (constraints.start_date and doc_timestamp < constraints.start_date or
                 constraints.end_date and doc_timestamp > constraints.end_date):
                 return 0.0

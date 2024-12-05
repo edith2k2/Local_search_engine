@@ -14,7 +14,7 @@ import logging
 
 # Import our search components
 from preprocessing import AsyncDocumentProcessor, BatchConfig
-from retriever import ChainOfThoughtRetriever, SearchResult
+from retriever import ChainOfThoughtRetriever, SearchResult, SearchIteration
 from answer_generator import AnswerGenerator, GeneratedAnswer
 from query_parser import TemporalConstraints, TimeFrame, SearchParameters
 
@@ -48,7 +48,7 @@ class StreamlitSearchUI:
     def __init__(self):
         # Configure the page with a clean, professional layout
         st.set_page_config(
-            page_title="AI-Powered Document Search",
+            page_title="Local Search Engine",
             page_icon="🔍",
             layout="wide",
             initial_sidebar_state="expanded"
@@ -72,7 +72,8 @@ class StreamlitSearchUI:
     def _initialize_session_state(self):
         """Initialize all required session state variables with default values"""
         default_state = {
-            'max_search_steps': 3,
+            'max_search_steps': 1,
+            'top_k': 5,
             'search_results': None,  # Will store (results, generated_answer) tuple
             'documents': {},
             'components_ready': False,
@@ -84,7 +85,8 @@ class StreamlitSearchUI:
             'processing_status': None,
             'error_message': None,
             'last_query': None,
-            'processing_time': None
+            'processing_time': None,
+            'current_iterations': None 
         }
         
         for key, value in default_state.items():
@@ -304,16 +306,7 @@ class StreamlitSearchUI:
         """Render the generated answer section with citations"""
         st.markdown("### AI-Generated Answer")
         
-        # Display confidence indicator
-        confidence_color = (
-            "🟢" if generated_answer.confidence_score >= 0.8 else
-            "🟡" if generated_answer.confidence_score >= 0.5 else
-            "🔴"
-        )
-        # st.markdown(
-        #     f"*Confidence Score: {confidence_color} "
-        #     f"{generated_answer.confidence_score:.2f}*"
-        # )
+        
         
         # Display answer in a clean box
         st.markdown(
@@ -347,25 +340,29 @@ class StreamlitSearchUI:
                 f"{generated_answer.metadata['generation_time']:.2f} seconds*"
             )
     
-    def render_temporal_controls(self) -> Optional[TemporalConstraints]:
-        """Render temporal search controls in the sidebar"""
-        st.sidebar.header("Time Range")
-        
-        time_frame = st.sidebar.radio(
+    def render_temporal_controls(self, prefix: str = "") -> Optional[TemporalConstraints]:
+        """
+        Render temporal search controls
+        Args:
+            prefix: String to prefix to keys to make them unique
+        """
+        time_frame = st.radio(
             "Select time frame:",
-            ["All Time", "Custom Range", "Recent"]
+            ["All Time", "Custom Range", "Recent"],
+            key=f"{prefix}time_frame_radio"
         )
         
         if time_frame == "Custom Range":
-            col1, col2 = st.sidebar.columns(2)
+            col1, col2 = st.columns(2)
             with col1:
-                start_date = st.date_input("Start Date")
+                start_date = st.date_input("Start Date", key=f"{prefix}start_date_input")
             with col2:
-                end_date = st.date_input("End Date")
+                end_date = st.date_input("End Date", key=f"{prefix}end_date_input")
                 
-            strict_temporal = st.sidebar.checkbox(
+            strict_temporal = st.checkbox(
                 "Strict time boundaries",
-                help="If checked, only show results exactly within the time range"
+                help="If checked, only show results exactly within the time range",
+                key=f"{prefix}strict_temporal_checkbox"
             )
             
             return TemporalConstraints(
@@ -375,9 +372,10 @@ class StreamlitSearchUI:
             )
             
         elif time_frame == "Recent":
-            period = st.sidebar.selectbox(
+            period = st.selectbox(
                 "Time period:",
-                ["Last 24 Hours", "Last Week", "Last Month"]
+                ["Last 24 Hours", "Last Week", "Last Month"],
+                key=f"{prefix}recent_period_select"
             )
             
             now = datetime.now()
@@ -394,11 +392,11 @@ class StreamlitSearchUI:
                 time_frame=TimeFrame.FLEXIBLE
             )
             
-        return None  # All Time selected
+        return None 
     
     def _render_results_section(self, results: List[SearchResult]):
         """Render the detailed search results section"""
-        st.markdown("### Detailed Search Results")
+        # st.markdown("### Detailed Search Results")
         
         # Display processing time if available
         if st.session_state.processing_time:
@@ -452,27 +450,231 @@ class StreamlitSearchUI:
                     if i < len(source_results):
                         st.markdown("---")
 
+    def _render_chain_of_thought_section(self, iterations: List[SearchIteration]):
+        """
+        Renders the chain of thought process using tabs and containers instead of nested expanders.
+        This approach maintains organization while avoiding the nested expander limitation.
+        """
+        with st.expander(" View Search Reasoning Process", expanded=False):
+            # Introduction text
+            # st.markdown("""
+            #     <div style='padding: 1rem; border-radius: 0.5rem; background-color: #f8f9fa; margin-bottom: 1rem;'>
+            #     This section shows how the search engine refined its understanding of your query through multiple steps. 
+            #     Each step includes the reasoning process and any query refinements made to improve results.
+            #     </div>
+            #     """, unsafe_allow_html=True)
+            
+            # Create tabs for each iteration
+            if len(iterations) > 0:
+                tabs = st.tabs([f"Step {i+1}" for i in range(len(iterations))])
+                
+                for i, (tab, iteration) in enumerate(zip(tabs, iterations)):
+                    with tab:
+                        # Display basic iteration information
+                        st.markdown(f"**Current Query:** {iteration.query}")
+                        
+                        if iteration.reasoning:
+                            # Create sections using columns and containers instead of expanders
+                            st.markdown("#### Analysis Summary")
+                            
+                            # Display reasoning in a styled container
+                            st.markdown("**Detailed Analysis:**")
+                            st.markdown(
+                                f"""<div style="padding: 1.5rem; 
+                                border-left: 3px solid #3498db; 
+                                background-color: #343a40; 
+                                color: #f8f9fa;
+                                border-radius: 0.5rem;
+                                margin: 0.75rem 0;
+                                line-height: 1.6;
+                                font-size: 1.1rem;">
+                                {iteration.reasoning.reasoning_explanation}
+                                </div>""",
+                                unsafe_allow_html=True
+                            )
+                            
+                            # Create two columns for gaps and refinements
+                            col1, col2 = st.columns(2)
+                            
+                            with col1:
+                                if iteration.reasoning.gaps_identified:
+                                    st.markdown("#### 🔍 Identified Gaps")
+                                    for gap in iteration.reasoning.gaps_identified:
+                                        st.markdown(f"• {gap}")
+                            
+                            with col2:
+                                if iteration.reasoning.suggested_refinement:
+                                    st.markdown("#### 🔄 Query Refinement")
+                                    st.markdown(f"**Refined to:** {iteration.reasoning.suggested_refinement}")
+                                    st.markdown("**Reason for refinement:**")
+                                    st.markdown(iteration.reasoning.reasoning_explanation.split('\n')[0])
+                            
+                            # Show relevance scores in a table
+                            # if iteration.reasoning.relevance_findings:
+                            #     st.markdown("#### 📈 Relevance Scores")
+                            #     scores_df = pd.DataFrame(
+                            #         [(f"Result {k}", f"{v:.2f}") for k, v in iteration.reasoning.relevance_findings.items()],
+                            #         columns=["Result", "Score"]
+                            #     )
+                            #     st.dataframe(
+                            #         scores_df,
+                            #         hide_index=True,
+                            #         use_container_width=True
+                            #     )
+
+    async def _perform_search_with_progress(self, query: str, temporal_constraints: Optional[TemporalConstraints] = None):
+        """
+        Executes the search and answer generation with progressive display:
+        1. Answer container at top
+        2. Steps in middle
+        3. Sources at bottom
+        """
+        try:
+            # Create all containers in visual order, but use regular containers
+            answer_container = st.container()  # Will be filled last but appears at top
+            answer_status = st.empty()  # Status placeholder inside answer section
+            
+            divider1 = st.container()  # Visual divider
+            
+            steps_container = st.container()  # Middle
+            sources_container = st.container()  # Bottom
+            
+            search_status = st.empty()  # Search status indicator
+
+            # Start search process
+            search_status.info("🔍 Performing search...")
+            start_time = time.time()
+
+            # Create search parameters with temporal constraints
+            search_params = SearchParameters(
+                query=query,
+                ui_temporal=temporal_constraints,
+                nl_temporal=None,
+                strict_temporal=True if temporal_constraints and temporal_constraints.has_constraints else False
+            )
+            # Execute search with steps
+            # results, iterations = await st.session_state.retriever.search(
+            #     query, 
+            #     return_steps=True
+            # )
+            results, iterations = await st.session_state.retriever.search_with_parameters(
+                params=search_params,
+                return_steps=True
+            )
+
+            # Store iterations for persistence
+            st.session_state.current_iterations = iterations
+
+            # Clear search status
+            search_status.empty()
+
+            # Immediately display search steps if available
+            with steps_container:
+                if iterations:
+                    st.markdown("### Search Process and Analysis")
+                    self._render_chain_of_thought_section(iterations)
+
+            # Immediately display source documents
+            with sources_container:
+                if results:
+                    st.markdown("### Source Documents")
+                    st.markdown(f"*Search completed in {time.time() - start_time:.2f} seconds*")
+                    self._render_results_section(results)
+
+            # Show answer generation status in the answer section
+            answer_status.info("Generating comprehensive answer...")
+
+            # Generate answer
+            generated_answer = await st.session_state.answer_generator.generate_answer(
+                query,
+                results
+            )
+
+            # Clear answer status
+            answer_status.empty()
+
+            # Display answer at the top
+            with answer_container:
+                if generated_answer:
+                    if st.session_state.last_query:
+                        st.markdown(f'*Results for: "{st.session_state.last_query}"*')
+                    self._render_answer_section(generated_answer)
+                    
+                    # Add visual separator
+                    with divider1:
+                        st.markdown("---")
+
+            # Store final results in session state
+            st.session_state.search_results = (results, generated_answer)
+            st.session_state.last_query = query
+
+        except Exception as e:
+            st.error(f"Error during search: {str(e)}")
+
+    def format_time_range(self, temporal_constraints):
+        """Convert datetime range to human readable format"""
+        if not temporal_constraints.start_date:
+            return "from any time until now"
+            
+        now = datetime.now()
+        start = temporal_constraints.start_date
+        end = temporal_constraints.end_date or now
+        
+        # Calculate the difference
+        diff_start = now - start
+        
+        # Convert to natural language
+        if diff_start.days == 0:  # Today
+            if end == now:
+                return "from today until now"
+            return f"from today until {end.strftime('%B %d')}"
+        elif diff_start.days == 1:  # Yesterday
+            return "from yesterday until now"
+        elif diff_start.days < 7:  # Last few days
+            return f"from {diff_start.days} days ago until now"
+        elif diff_start.days < 31:  # Weeks
+            weeks = diff_start.days // 7
+            return f"from {weeks} week{'s' if weeks > 1 else ''} ago until now"
+        else:  # Months/specific dates
+            return f"from {start.strftime('%B %d, %Y')} to {end.strftime('%B %d, %Y')}"
+        
     def render_ui(self):
         """Render the main user interface"""
         st.title("AI-Powered Document Search")
         
-        temporal_constraints = self.render_temporal_controls()
+        # temporal_constraints = self.render_temporal_controls()
         # Sidebar configuration
         with st.sidebar:
             st.header("Configuration")
             
-            st.header("Search Configuration")
+            # Time Range section in collapsible expander
+            with st.expander("🕒 Time Range", expanded=False):
+                temporal_constraints = self.render_temporal_controls(prefix="sidebar_")
             
-            # Use number_input for better control
-            st.number_input(
-                "Maximum chain of thought search steps",
-                min_value=0,
-                max_value=5,
-                value=st.session_state.max_search_steps,
-                key="steps_input",
-                help="Set the maximum number iterations for chain of thought search",
-                on_change=self._on_steps_change
-            )
+            # Search Configuration in collapsible expander
+            with st.expander("⚙️ Search Configuration", expanded=False):
+                st.number_input(
+                    "Maximum chain of thought search steps",
+                    min_value=0,
+                    max_value=5,
+                    value=st.session_state.max_search_steps,
+                    key="steps_input",
+                    help="Set the maximum number iterations for chain of thought search",
+                    on_change=self._on_steps_change
+                )
+                top_k = st.number_input(
+                    "Number of results to retrieve (top-k)",
+                    min_value=1,
+                    max_value=20,
+                    value=st.session_state.top_k,
+                    step=1,
+                    help="Set the number of top results to retrieve from search"
+                )
+
+                if top_k != st.session_state.top_k:
+                    st.session_state.top_k = top_k
+                    if st.session_state.retriever:
+                        st.session_state.retriever.top_k = top_k
 
             # API key input if not set
             if not st.session_state.api_key:
@@ -485,53 +687,51 @@ class StreamlitSearchUI:
                     st.session_state.api_key = api_key
                     self._run_async(self._initialize_components())
             
-            # Document upload section
+            # Document upload section in collapsible expander
             if st.session_state.components_ready:
-                st.header("Document Processing")
-                with st.form("document_upload_form"):
-                    uploaded_files = st.file_uploader(
-                        "Upload Documents",
-                        accept_multiple_files=True,
-                        type=['txt', 'pdf'],
-                        help="Upload text or PDF documents for processing"
-                    )
+                with st.expander("📁 Document Upload", expanded=False):
+                    with st.form("document_upload_form"):
+                        uploaded_files = st.file_uploader(
+                            "Upload Documents",
+                            accept_multiple_files=True,
+                            type=['txt', 'pdf'],
+                            help="Upload text or PDF documents for processing"
+                        )
+                        
+                        submit_button = st.form_submit_button("Process Documents")
+                        
+                        if submit_button and uploaded_files:
+                            with st.spinner("Processing documents..."):
+                                self._run_async(self._process_documents(uploaded_files))
                     
-                    submit_button = st.form_submit_button("Process Documents")
+                    if st.session_state.processing_status:
+                        st.info(st.session_state.processing_status)
+
+            # Separate document list expander
+            if st.session_state.components_ready and st.session_state.documents:
+                with st.expander(f"📚 Document Library ({len(st.session_state.documents)})", expanded=False):
+                    # Display document count
+                    st.markdown(f"**Total Documents:** {len(st.session_state.documents)}")
+                    st.markdown("---")
                     
-                    if submit_button and uploaded_files:
-                        with st.spinner("Processing documents..."):
-                            self._run_async(self._process_documents(uploaded_files))
-                
-                # if uploaded_files:
-                #     if st.button("Process Documents", type="primary"):
-                #         self._run_async(self._process_documents(uploaded_files))
-                
-                # Show document statistics
-                if st.session_state.documents:
-                    st.markdown(
-                        f"📚 **Processed Documents:** "
-                        f"{len(st.session_state.documents)}"
-                    )
-                    # st.sidebar.header("📚 Document Library")
-    
-                    # Create an expander to show document details
-                    with st.sidebar.expander(f"View All Documents ({len(st.session_state.documents)})", expanded=False):
-                        # Iterate through documents and display their information
-                        for file_path, doc_data in st.session_state.documents.items():
-                            metadata = doc_data['metadata']
-                            
-                            # Create a clean display for each document
-                            st.markdown(f"""
-                            **{metadata['file_name']}**  
-                            - Size: {format_size(metadata['size_bytes'])}
-                            - Chunks: {metadata['num_chunks']}
-                            - Type: {metadata['file_type']}
-                            - Added: {format_date(metadata['created_time'])}
-                            ---
-            """)
-                
-                if st.session_state.processing_status:
-                    st.info(st.session_state.processing_status)
+                    # Display document details in a scrollable container
+                    for file_path, doc_data in st.session_state.documents.items():
+                        metadata = doc_data['metadata']
+                        
+                        # Create a clean, compact display for each document
+                        st.markdown(
+                            f"""<div style='padding: 5px 0;'>
+                            <strong>{metadata['file_name']}</strong><br/>
+                            <small>
+                            📄 {metadata['file_type']} | 
+                            💾 {format_size(metadata['size_bytes'])} | 
+                            📑 {metadata['num_chunks']} chunks<br/>
+                            📅 Added: {format_date(metadata['created_time'])}
+                            </small>
+                            </div>""", 
+                            unsafe_allow_html=True
+                        )
+                        st.markdown("---")
         
         # Main search interface
         if st.session_state.components_ready:
@@ -544,43 +744,22 @@ class StreamlitSearchUI:
             )
             
             if temporal_constraints and temporal_constraints.has_constraints:
-                st.info(
-                    "🕒 Searching within time range: "
-                    f"{temporal_constraints.start_date.strftime('%Y-%m-%d %H:%M:%S') if temporal_constraints.start_date else 'any time'} "
-                    f"to {temporal_constraints.end_date.strftime('%Y-%m-%d %H:%M:%S') if temporal_constraints.end_date else 'now'}"
-                )
+                st.info("🕒 Search " + self.format_time_range(temporal_constraints)
+)
 
             col1, col2 = st.columns([1, 4])
             with col1:
                 search_clicked = st.button("Search", type="primary")
             
-            # Execute search
+            # Handle search
             if search_clicked and query:
                 if not st.session_state.documents:
                     st.warning("Please upload and process some documents first.")
                 else:
-                    with st.spinner("Searching documents and generating answer..."):
-                        search_output = self._run_async(self._perform_search(query, temporal_constraints))
-                        if search_output:
-                            results, generated_answer = search_output
-                            st.session_state.search_results = (results, generated_answer)
-                            st.session_state.last_query = query
+                    # Clear existing results
+                    st.session_state.search_results = None
+                    asyncio.run(self._perform_search_with_progress(query, temporal_constraints))
             
-            # Display results
-            if st.session_state.search_results:
-                results, generated_answer = st.session_state.search_results
-                
-                # Show the query that generated these results
-                if st.session_state.last_query:
-                    st.markdown(
-                        f'*Results for: "{st.session_state.last_query}"*'
-                    )
-                
-                # Render answer and results sections
-                if generated_answer:
-                    self._render_answer_section(generated_answer)
-                self._render_results_section(results)
-        
         # Error display
         if st.session_state.error_message:
             st.error(st.session_state.error_message)

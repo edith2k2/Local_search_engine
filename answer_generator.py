@@ -103,9 +103,10 @@ Source Passages:
 Create a comprehensive answer that:
 1. Starts with a direct response to the question
 2. Uses specific details and evidence from the sources
-3. Attributes information using "Source [X]" citations
+3. Use "**[Source X]**" to attribute information
 4. Connects related concepts to build understanding
 5. Concludes with key takeaways
+6. Sources with their names comma seperated
 
 Your answer:"""
 
