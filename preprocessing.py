@@ -1,6 +1,6 @@
 import os
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional, Union, Tuple
 import numpy as np
 import torch
 from pathlib import Path
@@ -29,6 +29,9 @@ from typing import TypedDict
 import backoff 
 import aiohttp
 import json
+import re
+import string
+from tokenizer import Tokenizer
 
 # Configure logging with detailed format
 logging.basicConfig(
@@ -72,13 +75,9 @@ class ProcessedChunk:
 
 def initialize_worker():
     """Initialize necessary resources in each worker process"""
-    global stop_words, model
+    global tokenizer
     try:
-        # Download NLTK resources silently
-        nltk.download('punkt', quiet=True)
-        nltk.download('stopwords', quiet=True)
-        stop_words = set(stopwords.words('english'))
-        
+        tokenizer = Tokenizer()
     except Exception as e:
         logger.error(f"Error initializing worker process: {str(e)}")
         raise
@@ -127,14 +126,13 @@ def compute_embeddings_worker(
         elif device == 'cuda':
             torch.cuda.empty_cache()
 
-def preprocess_text_worker(text: str) -> List[str]:
-    """Worker function for text preprocessing in separate processes"""
+def preprocess_texts_worker(texts: List[str]) -> List[List[str]]:
+    """Worker function for batch text preprocessing"""
     try:
-        tokens = word_tokenize(text.lower())
-        return [token for token in tokens if token not in stop_words and token.isalpha()]
+        return tokenizer.batch_tokenize(texts)
     except Exception as e:
         logger.error(f"Error in preprocessing worker: {str(e)}")
-        return []
+        return [[] for _ in texts]
 
 def create_process_pool(num_processes: int) -> ProcessPoolExecutor:
     """Create a process pool with proper initialization"""
@@ -144,6 +142,38 @@ def create_process_pool(num_processes: int) -> ProcessPoolExecutor:
         max_workers=num_processes,
         initializer=initialize_worker  # Use fully qualified reference
     )
+
+class CustomBM25:
+    """
+    Enhanced BM25 implementation with improved technical term handling.
+    """
+    
+    def __init__(self, corpus):
+        self.tokenized_corpus = [preprocess_text_worker(doc) for doc in corpus]
+        self.bm25 = BM25Okapi(self.tokenized_corpus)
+        
+        # Build vocabulary with frequency information
+        self.vocabulary = {}
+        for doc in self.tokenized_corpus:
+            for token in doc:
+                self.vocabulary[token] = self.vocabulary.get(token, 0) + 1
+    
+    def get_scores(self, query: str) -> np.ndarray:
+        query_tokens = preprocess_text_worker(query)
+        return self.bm25.get_scores(query_tokens)
+    
+    def get_matching_terms(self, query: str) -> Dict[str, int]:
+        """Get matching terms and their corpus frequencies for debugging"""
+        query_tokens = preprocess_text_worker(query)
+        return {
+            token: self.vocabulary.get(token, 0)
+            for token in query_tokens
+            if token in self.vocabulary
+        }
+        
+    def get_document_terms(self, doc_idx: int) -> List[str]:
+        """Get the tokenized terms for a specific document"""
+        return self.tokenized_corpus[doc_idx] if 0 <= doc_idx < len(self.tokenized_corpus) else []
 
 class LocalLLMClient:
     """Client for interacting with local LLM through Ollama API"""
@@ -352,17 +382,14 @@ class AsyncDocumentProcessor:
             return np.zeros((len(texts), self.embedding_dim))
 
     async def preprocess_texts_parallel(self, texts: List[str]) -> List[List[str]]:
-        """Preprocess texts in parallel using multiple processes"""
+        """Preprocess texts in parallel using batch processing"""
         try:
-            # Submit preprocessing tasks to process pool
-            futures = [
-                self.process_pool.submit(preprocess_text_worker, text)
-                for text in texts
-            ]
-            
-            # Gather results
-            return [future.result() for future in futures]
-            
+            # Process all texts in a single batch using spaCy's efficient pipe
+            return await asyncio.get_event_loop().run_in_executor(
+                self.process_pool,
+                preprocess_texts_worker,
+                texts
+            )
         except Exception as e:
             logger.error(f"Error in parallel text preprocessing: {str(e)}")
             return [[] for _ in texts]
