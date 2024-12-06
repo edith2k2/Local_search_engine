@@ -640,7 +640,7 @@ class StreamlitSearchUI:
         
     def render_ui(self):
         """Render the main user interface"""
-        st.title("AI-Powered Document Search")
+        st.title("Document Search Engine")
         
         # temporal_constraints = self.render_temporal_controls()
         # Sidebar configuration
